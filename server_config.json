@@ -1,0 +1,7 @@
+{
+    "addr": ":8443",
+    "cert": "cert.pem",
+    "key": "key.pem",
+    "token": "zhc",
+    "dial_timeout": "10s"
+}

@@ -1,0 +1,1 @@
+.\client -local :1080 -server https://lv6.kszhc.top:8443  -insecure -token zhc

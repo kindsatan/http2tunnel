@@ -1,0 +1,17 @@
+# 方式1: 纯配置文件（推荐）
+./server.exe
+
+# 方式2: 指定配置文件
+./server.exe -config my_config.json
+
+# 方式3: 命令行参数覆盖配置文件中的值
+./server.exe -addr :9443 -token mytoken
+
+# 方式4: 通过 run.bat 启动
+run.bat
+
+转发upd端口
+.\client.exe -local :51820 -server https://172.16.0.28:8443 -target 192.168.1.1:51820 -udp -insecure
+
+socks5模式
+.\client.exe -local :1080 -server https://lv6.kszhc.top:8443 -insecure

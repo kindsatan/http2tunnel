@@ -1,0 +1,1 @@
+.\client.exe -local :51820 -server https://172.16.0.28:8443 -target 192.168.1.1:51820 -udp -insecure
