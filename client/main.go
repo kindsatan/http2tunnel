@@ -1,34 +1,32 @@
-// HTTP/2 隧道代理 - 客户端（多模式）
+// HTTP/2 隧道代理 - 客户端（多模式 + 多传输）
 //
 // 支持四种工作模式：
 //
 // 模式1 - TCP 固定目标转发（-target + 默认）：
 //   将本地 TCP 端口的所有连接直接转发到固定目标地址。
-//   数据流向：本地 TCP → HTTP/2 stream → HTTPS → 服务端 → 目标 TCP
 //
 // 模式2 - UDP 固定目标转发（-target + -udp）：
-//   将本地 UDP 端口的数据报通过 HTTP/2 隧道转发到目标 UDP 端点。
-//   数据流向：本地 UDP → 帧封装 → HTTP/2 stream → HTTPS → 服务端 → 目标 UDP
-//   典型场景：WireGuard (UDP 51820)
+//   将本地 UDP 端口的数据报通过隧道转发到目标 UDP 端点。
 //
 // 模式3 - SOCKS5 代理（不指定 -target）：
 //   在本地提供 SOCKS5 代理服务，由浏览器动态指定目标地址。
-//   数据流向：浏览器 ←SOCKS5→ 客户端 ←HTTP/2 stream→ 服务端 ←TCP→ 目标网站
 //
 // 模式4 - TUN IP 隧道（-tun）：
-//   创建本地 TUN 虚拟网络接口，通过 HTTP/2 隧道实现 IP 层点对点连接。
-//   数据流向：本地 TUN ↔ 帧封装 ↔ HTTP/2 stream ↔ 服务端 TUN
-//   典型场景：VPN、跨节点 IP 互联
+//   创建本地 TUN 虚拟网络接口，实现 IP 层点对点连接。
 //
-// 帧封装格式（UDP/TUN 模式，在 HTTP/2 字节流上保留包边界）：
-//   +----------+----------------------------+
-//   | LEN (2B) | 数据报/IP包 (LEN B)         |
-//   +----------+----------------------------+
-//     大端序      最大 65535 字节
+// 支持三种传输方式（-transport 参数）：
 //
-// HTTP/2 连接复用：
-//   所有隧道共享同一个底层 TLS 连接（HTTP/2 多路复用），
-//   每个连接对应一个 HTTP/2 stream。
+//   http2（默认）- HTTP/2 over TLS：
+//     加密传输，协议兼容性好，有 TLS + HTTP/2 帧开销
+//     -server 使用 URL 格式：https://host:port
+//
+//   tcp - TCP 明文传输：
+//     无加密，最低开销，支持所有隧道模式
+//     -server 使用地址格式：host:port
+//
+//   udp - UDP 明文传输：
+//     无加密，无队头阻塞，仅支持 UDP 转发和 TUN 模式
+//     -server 使用地址格式：host:port
 
 package main
 
@@ -134,13 +132,14 @@ var activeConns int64
 func main() {
 	// ========== 命令行参数 ==========
 	localAddr := flag.String("local", ":1080", "本地监听地址")
-	serverURL := flag.String("server", "https://127.0.0.1:8443", "服务端 URL")
+	serverURL := flag.String("server", "https://127.0.0.1:8443", "服务端地址 (HTTP/2: https://host:port, TCP/UDP: host:port)")
 	target := flag.String("target", "", "固定目标地址 (host:port)，留空则启用 SOCKS5 模式")
 	udpMode := flag.Bool("udp", false, "启用 UDP 转发模式（需配合 -target 使用）")
 	token := flag.String("token", "", "服务端认证令牌")
-	insecure := flag.Bool("insecure", false, "跳过 TLS 证书验证（自签名证书时使用）")
+	insecure := flag.Bool("insecure", false, "跳过 TLS 证书验证（仅 HTTP/2 传输，自签名证书时使用）")
 	socksUser := flag.String("socks-user", "", "SOCKS5 用户名（仅 SOCKS5 模式，留空则不启用认证）")
 	socksPass := flag.String("socks-pass", "", "SOCKS5 密码（仅 SOCKS5 模式）")
+	transportType := flag.String("transport", "http2", "传输协议类型: http2, tcp, udp")
 
 	// TUN 隧道参数
 	tunMode := flag.Bool("tun", false, "启用 TUN 隧道模式")
@@ -166,10 +165,46 @@ func main() {
 		}
 	}
 
-	// ========== 配置 TLS ==========
+	// 验证传输类型
+	switch *transportType {
+	case "http2", "tcp", "udp":
+		// OK
+	default:
+		log.Fatalf("[致命] 不支持的传输类型: %s (可选: http2, tcp, udp)", *transportType)
+	}
+
+	// UDP 传输仅支持 UDP 转发和 TUN 模式
+	if *transportType == "udp" {
+		if !*tunMode && !*udpMode {
+			log.Fatal("[致命] UDP 传输仅支持 -udp 转发模式和 -tun 隧道模式（TCP 流式数据需要可靠传输）")
+		}
+	}
+
+	// ========== 根据传输类型和模式启动 ==========
+	switch *transportType {
+	case "http2":
+		startHTTP2Transport(*localAddr, *serverURL, *target, *udpMode, *tunMode,
+			*token, *insecure, *socksUser, *socksPass,
+			*tunIP, *tunName, *tunMTU)
+	case "tcp":
+		startTCPTransport(*localAddr, *serverURL, *target, *udpMode, *tunMode,
+			*token, *socksUser, *socksPass,
+			*tunIP, *tunName, *tunMTU)
+	case "udp":
+		startUDPTransport(*localAddr, *serverURL, *target, *udpMode, *tunMode,
+			*token, *tunIP, *tunName, *tunMTU)
+	}
+}
+
+// ==================== HTTP/2 传输模式 ====================
+
+func startHTTP2Transport(localAddr, serverURL, target string, udpMode, tunMode bool,
+	token string, insecure bool, socksUser, socksPass string,
+	tunIP, tunName string, tunMTU int) {
+
+	// 配置 TLS
 	tlsConfig := &tls.Config{
-		InsecureSkipVerify: *insecure,
-		// 优先使用高性能密码套件（AES-GCM 硬件加速 > ChaCha20）
+		InsecureSkipVerify: insecure,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -181,57 +216,69 @@ func main() {
 		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 	}
 
-	// ========== 配置 HTTP/2 传输层（性能优化） ==========
+	// 配置 HTTP/2 传输层
 	transport := &http2.Transport{
 		TLSClientConfig:    tlsConfig,
-		DisableCompression: true,             // 隧道数据无需压缩，避免 CPU 开销
-		MaxReadFrameSize:   maxFrameSize,     // 增大帧大小到 1MB
+		DisableCompression: true,
+		MaxReadFrameSize:   maxFrameSize,
 		AllowHTTP:          false,
-		ReadIdleTimeout:    90 * time.Second, // 90s 空闲检测
-		PingTimeout:        15 * time.Second, // 15s ping 超时
+		ReadIdleTimeout:    90 * time.Second,
+		PingTimeout:        15 * time.Second,
 	}
 
 	client := &http.Client{
 		Transport: transport,
 	}
 
-	// ========== 根据模式启动 ==========
-	if *tunMode {
-		// TUN IP 隧道模式
-		tunURL := *serverURL + "/tun"
-		startTUNMode(*tunIP, *tunName, *tunMTU, client, tunURL, *token, *insecure)
-	} else if *udpMode {
-		// UDP 转发模式：监听本地 UDP 端口
-		tunnelURL := *serverURL + "/tunnel"
-		startUDPMode(*localAddr, client, tunnelURL, *target, *token, *insecure)
-	} else if *target != "" {
-		// TCP 固定目标转发模式
-		tunnelURL := *serverURL + "/tunnel"
-		startTCPForwardMode(*localAddr, client, tunnelURL, *target, *token, *insecure, *socksUser, *socksPass)
+	if tunMode {
+		tunURL := serverURL + "/tun"
+		startTUNMode(tunIP, tunName, tunMTU, client, tunURL, token, insecure)
+	} else if udpMode {
+		tunnelURL := serverURL + "/tunnel"
+		startUDPMode(localAddr, client, tunnelURL, target, token, insecure)
 	} else {
-		// SOCKS5 代理模式
-		tunnelURL := *serverURL + "/tunnel"
-		startTCPForwardMode(*localAddr, client, tunnelURL, *target, *token, *insecure, *socksUser, *socksPass)
+		tunnelURL := serverURL + "/tunnel"
+		startTCPForwardMode(localAddr, client, tunnelURL, target, token, insecure, socksUser, socksPass)
 	}
 }
 
-// ==================== TUN 隧道模式 ====================
+// ==================== TCP 明文传输模式 ====================
 
-// startTUNMode 启动 TUN IP 隧道模式
-//
-// 工作原理：
-//   - 创建本地 TUN 虚拟网络接口
-//   - 建立到服务端 /tun 端点的 HTTP/2 stream
-//   - 双向转发帧封装的 IP 包：本地 TUN ↔ HTTP/2 ↔ 服务端 TUN
-//   - 实现 IP 层点对点连接，支持 ping、路由等标准网络操作
+func startTCPTransport(localAddr, serverAddr, target string, udpMode, tunMode bool,
+	token, socksUser, socksPass string,
+	tunIP, tunName string, tunMTU int) {
+
+	if tunMode {
+		startTUNModeRawTCP(tunIP, tunName, tunMTU, serverAddr, token)
+	} else if udpMode {
+		startUDPModeRawTCP(localAddr, serverAddr, target, token)
+	} else {
+		startTCPForwardModeRawTCP(localAddr, serverAddr, target, token, socksUser, socksPass)
+	}
+}
+
+// ==================== UDP 明文传输模式 ====================
+
+func startUDPTransport(localAddr, serverAddr, target string, udpMode, tunMode bool,
+	token string, tunIP, tunName string, tunMTU int) {
+
+	if tunMode {
+		startTUNModeRawUDP(tunIP, tunName, tunMTU, serverAddr, token)
+	} else if udpMode {
+		startUDPModeRawUDP(localAddr, serverAddr, target, token)
+	}
+	// TCP/SOCKS5 模式已在 main() 中排除
+}
+
+// ==================== TUN 隧道模式（HTTP/2 传输） ====================
+
+// startTUNMode 启动 TUN IP 隧道模式（HTTP/2 传输）
 func startTUNMode(tunIPCIDR, tunName string, tunMTU int, client *http.Client, tunURL, token string, insecure bool) {
-	// 解析客户端 TUN IP（不带 CIDR 前缀）用于 X-TUN-IP 头
 	ip, _, err := net.ParseCIDR(tunIPCIDR)
 	if err != nil {
 		log.Fatalf("[致命] 解析 TUN IP 失败: %v", err)
 	}
 
-	// 创建 TUN 接口
 	tunDev, err := tun.CreateTUN(tunName, tunIPCIDR, tunMTU)
 	if err != nil {
 		log.Fatalf("[致命] 创建 TUN 接口失败: %v", err)
@@ -247,10 +294,8 @@ func startTUNMode(tunIPCIDR, tunName string, tunMTU int, client *http.Client, tu
 		log.Printf("[警告] TLS 证书验证已禁用")
 	}
 
-	// 创建管道，用于将 TUN IP 包帧封装后送入 HTTP/2 请求体
 	pr, pw := io.Pipe()
 
-	// 构建 HTTP/2 隧道请求
 	req, err := http.NewRequest(http.MethodPost, tunURL, pr)
 	if err != nil {
 		log.Fatalf("[致命] 创建请求失败: %v", err)
@@ -260,7 +305,6 @@ func startTUNMode(tunIPCIDR, tunName string, tunMTU int, client *http.Client, tu
 		req.Header.Set("X-Token", token)
 	}
 
-	// 异步发送请求
 	type result struct {
 		resp *http.Response
 		err  error
@@ -289,7 +333,7 @@ func startTUNMode(tunIPCIDR, tunName string, tunMTU int, client *http.Client, tu
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 方向1: 本地 TUN → 帧封装 → HTTP/2 请求体 → 服务端
+	// 本地 TUN → 帧封装 → HTTP/2 请求体 → 服务端
 	go func() {
 		defer wg.Done()
 		defer pw.Close()
@@ -302,7 +346,6 @@ func startTUNMode(tunIPCIDR, tunName string, tunMTU int, client *http.Client, tu
 				log.Printf("[TUN] 读取本地 TUN 错误: %v", err)
 				break
 			}
-			// 帧封装：[2字节长度][IP包]
 			binary.BigEndian.PutUint16(frameBuf[:2], uint16(n))
 			copy(frameBuf[2:], buf[:n])
 			if _, err := pw.Write(frameBuf[:2+n]); err != nil {
@@ -314,14 +357,13 @@ func startTUNMode(tunIPCIDR, tunName string, tunMTU int, client *http.Client, tu
 		log.Printf("[TUN] 本地→服务端: %d 字节", totalBytes)
 	}()
 
-	// 方向2: 服务端 HTTP/2 响应体 → 帧解封 → 本地 TUN
+	// 服务端 HTTP/2 响应体 → 帧解封 → 本地 TUN
 	go func() {
 		defer wg.Done()
 		lenBuf := make([]byte, 2)
 		pktBuf := make([]byte, tunMTU+100)
 		var totalBytes int64
 		for {
-			// 读取 2 字节长度前缀
 			if _, err := io.ReadFull(resp.Body, lenBuf); err != nil {
 				if err != io.EOF && err != io.ErrUnexpectedEOF {
 					log.Printf("[TUN] 读取服务端帧头错误: %v", err)
@@ -332,20 +374,15 @@ func startTUNMode(tunIPCIDR, tunName string, tunMTU int, client *http.Client, tu
 			if pktLen == 0 {
 				continue
 			}
-
 			if int(pktLen) > len(pktBuf) {
 				log.Printf("[TUN] IP 包过大: %d 字节 (MTU: %d)", pktLen, tunMTU)
 				io.CopyN(io.Discard, resp.Body, int64(pktLen))
 				continue
 			}
-
-			// 读取 IP 包内容
 			if _, err := io.ReadFull(resp.Body, pktBuf[:pktLen]); err != nil {
 				log.Printf("[TUN] 读取服务端数据错误: %v", err)
 				break
 			}
-
-			// 写入本地 TUN 接口
 			if _, err := tunDev.Write(pktBuf[:pktLen]); err != nil {
 				log.Printf("[TUN] 写入本地 TUN 错误: %v", err)
 				break
@@ -353,14 +390,13 @@ func startTUNMode(tunIPCIDR, tunName string, tunMTU int, client *http.Client, tu
 			totalBytes += int64(pktLen)
 		}
 		log.Printf("[TUN] 服务端→本地: %d 字节", totalBytes)
-		// 关闭 TUN 设备以终止另一个 goroutine
 		tunDev.Close()
 	}()
 
 	wg.Wait()
 }
 
-// ==================== TCP/SOCKS5 模式 ====================
+// ==================== TCP/SOCKS5 模式（HTTP/2 传输） ====================
 
 // startTCPForwardMode 启动 TCP 监听（固定目标转发或 SOCKS5 模式）
 func startTCPForwardMode(localAddr string, client *http.Client, tunnelURL, target, token string, insecure bool, socksUser, socksPass string) {
@@ -401,7 +437,7 @@ func startTCPForwardMode(localAddr string, client *http.Client, tunnelURL, targe
 	}
 }
 
-// ==================== UDP 转发模式 ====================
+// ==================== UDP 转发模式（HTTP/2 传输） ====================
 
 // startUDPMode 启动 UDP 监听并建立单条 HTTP/2 隧道转发所有 UDP 数据报
 func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, token string, insecure bool) {
@@ -416,7 +452,6 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 	}
 	defer udpConn.Close()
 
-	// 增大 UDP socket 缓冲区
 	udpConn.SetReadBuffer(4 * 1024 * 1024)
 	udpConn.SetWriteBuffer(4 * 1024 * 1024)
 
@@ -429,10 +464,8 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 		log.Printf("[警告] TLS 证书验证已禁用")
 	}
 
-	// 创建管道，用于将 UDP 数据报帧封装后送入 HTTP/2 请求体
 	pr, pw := io.Pipe()
 
-	// 构建 HTTP/2 隧道请求
 	req, err := http.NewRequest(http.MethodPost, tunnelURL, pr)
 	if err != nil {
 		log.Fatalf("[致命] 创建请求失败: %v", err)
@@ -443,7 +476,6 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 		req.Header.Set("X-Token", token)
 	}
 
-	// 异步发送请求
 	type result struct {
 		resp *http.Response
 		err  error
@@ -467,13 +499,12 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 
 	log.Printf("[隧道] UDP 隧道建立成功 (协议: %s)", resp.Proto)
 
-	// peerAddr 记录最近一次收到 UDP 数据报的来源地址
 	var peerAddr atomic.Value
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 方向1: 本地 UDP → 帧封装 → HTTP/2 请求体 → 服务端
+	// 本地 UDP → 帧封装 → HTTP/2 请求体 → 服务端
 	go func() {
 		defer wg.Done()
 		defer pw.Close()
@@ -499,7 +530,7 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 		log.Printf("[数据] 本地→服务端 UDP: %d 字节", totalBytes)
 	}()
 
-	// 方向2: 服务端 HTTP/2 响应体 → 帧解封 → 本地 UDP
+	// 服务端 HTTP/2 响应体 → 帧解封 → 本地 UDP
 	go func() {
 		defer wg.Done()
 		lenBuf := make([]byte, 2)
@@ -539,7 +570,7 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 	wg.Wait()
 }
 
-// ==================== TCP 转发处理 ====================
+// ==================== TCP 转发处理（HTTP/2 传输） ====================
 
 // handleForward 处理固定目标 TCP 转发模式的连接
 func handleForward(conn net.Conn, client *http.Client, tunnelURL, target, token string) {
@@ -598,7 +629,7 @@ func handleForward(conn net.Conn, client *http.Client, tunnelURL, target, token 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 本地 → 服务端（使用 256KB 缓冲区池）
+	// 本地 → 服务端
 	go func() {
 		defer wg.Done()
 		n, err := copyBuffered(pw, conn)
@@ -609,7 +640,7 @@ func handleForward(conn net.Conn, client *http.Client, tunnelURL, target, token 
 		pw.Close()
 	}()
 
-	// 服务端 → 本地（使用 256KB 缓冲区池）
+	// 服务端 → 本地
 	go func() {
 		defer wg.Done()
 		n, err := copyBuffered(conn, resp.Body)
@@ -625,7 +656,7 @@ func handleForward(conn net.Conn, client *http.Client, tunnelURL, target, token 
 	wg.Wait()
 }
 
-// ==================== SOCKS5 处理 ====================
+// ==================== SOCKS5 处理（HTTP/2 传输） ====================
 
 // handleSocks5 处理单个 SOCKS5 连接
 func handleSocks5(conn net.Conn, client *http.Client, tunnelURL, token, socksUser, socksPass string) {
@@ -700,7 +731,7 @@ func handleSocks5(conn net.Conn, client *http.Client, tunnelURL, token, socksUse
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 浏览器 → 服务端（使用 256KB 缓冲区池）
+	// 浏览器 → 服务端
 	go func() {
 		defer wg.Done()
 		n, err := copyBuffered(pw, conn)
@@ -711,7 +742,7 @@ func handleSocks5(conn net.Conn, client *http.Client, tunnelURL, token, socksUse
 		pw.Close()
 	}()
 
-	// 服务端 → 浏览器（使用 256KB 缓冲区池）
+	// 服务端 → 浏览器
 	go func() {
 		defer wg.Done()
 		n, err := copyBuffered(conn, resp.Body)

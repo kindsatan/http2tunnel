@@ -1,23 +1,21 @@
 // HTTP/2 隧道代理 - 服务端
 //
-// 功能：接收客户端的 HTTP/2 连接请求，根据协议类型将数据转发到目标 TCP、UDP 服务器，
+// 功能：接收客户端连接请求，根据协议类型将数据转发到目标 TCP、UDP 服务器，
 // 或通过 TUN 虚拟网络接口实现 IP 层互联互通。
 //
+// 支持三种传输方式：
+//   - HTTP/2 over TLS（默认，端口 :8443）
+//   - TCP 明文传输（可选，端口 :9443）
+//   - UDP 明文传输（可选，端口 :9444）
+//
 // 数据流向：
-//   TCP 模式: 客户端 HTTP/2 stream ↔ 服务端 ↔ 目标 TCP 连接
-//   UDP 模式: 客户端 HTTP/2 stream ↔ 服务端(帧封装/解封) ↔ 目标 UDP 端点
-//   TUN 模式: 客户端 TUN ↔ HTTP/2 stream ↔ 服务端 TUN（IP 层点对点隧道）
+//   TCP 模式: 客户端 ↔ 传输层 ↔ 服务端 ↔ 目标 TCP 连接
+//   UDP 模式: 客户端 ↔ 传输层(帧封装/解封) ↔ 服务端 ↔ 目标 UDP 端点
+//   TUN 模式: 客户端 TUN ↔ 传输层 ↔ 服务端 TUN（IP 层点对点隧道）
 //
 // 协议设计：
-//   - 客户端通过 POST /tunnel 发起 TCP/UDP 隧道请求
-//   - 客户端通过 POST /tun 发起 TUN IP 隧道请求
-//   - X-Target 头指定目标地址 (host:port)
-//   - X-Protocol 头指定协议类型（"tcp" 或 "udp"，默认 "tcp"）
-//   - X-Token 头用于可选的认证令牌校验
-//   - X-TUN-IP 头指定客户端 TUN 接口 IP（仅 TUN 模式）
-//   - TCP 模式：请求体/响应体直接承载字节流
-//   - UDP/TUN 模式：请求体/响应体使用帧封装 [2字节长度][数据报/IP包]
-//   - 利用 HTTP/2 多路复用，多条隧道共享单个 TLS 连接
+//   HTTP/2 传输：POST /tunnel（TCP/UDP）、POST /tun（TUN）
+//   TCP/UDP 明文传输：二进制握手协议（见 transport/protocol.go）
 
 package main
 
@@ -84,11 +82,19 @@ var udpBufPool = sync.Pool{
 
 // ServerConfig 服务端配置结构体，对应 JSON 配置文件
 type ServerConfig struct {
-	Addr        string `json:"addr"`         // 监听地址，如 ":8443"
+	Addr        string `json:"addr"`         // HTTP/2 监听地址，如 ":8443"
 	Cert        string `json:"cert"`         // TLS 证书文件路径
 	Key         string `json:"key"`          // TLS 私钥文件路径
 	Token       string `json:"token"`        // 认证令牌
 	DialTimeout string `json:"dial_timeout"` // 连接超时时间，如 "10s"、"30s"
+
+	// TCP 明文传输配置
+	RawTCPEnabled bool   `json:"raw_tcp_enabled"` // 是否启用 TCP 明文传输
+	RawTCPAddr    string `json:"raw_tcp_addr"`    // TCP 明文监听地址，如 ":9443"
+
+	// UDP 明文传输配置
+	RawUDPEnabled bool   `json:"raw_udp_enabled"` // 是否启用 UDP 明文传输
+	RawUDPAddr    string `json:"raw_udp_addr"`    // UDP 明文监听地址，如 ":9444"
 
 	// TUN 隧道配置
 	TunEnabled bool   `json:"tun_enabled"` // 是否启用 TUN 隧道功能
@@ -154,10 +160,14 @@ var activeConns int64
 // ==================== TUN 隧道管理 ====================
 
 // tunClient 表示一个已连接的 TUN 客户端
+//
+// writePacket 是一个闭包，根据传输方式不同实现不同的写入逻辑：
+//   - HTTP/2/TCP 传输: 帧封装 [2B长度][IP包] 后写入流
+//   - UDP 传输: 直接发送 UDP 数据报（每个 IP 包一个数据报）
 type tunClient struct {
-	writer *flushWriter
-	mu     sync.Mutex
-	closed bool
+	writePacket func([]byte) error
+	mu          sync.Mutex
+	closed      bool
 }
 
 // tunManager 管理服务端 TUN 设备和客户端路由
@@ -200,10 +210,9 @@ func (m *tunManager) unregister(ip string) {
 // IP 包路由逻辑：
 //   - 解析 IP 包头获取目的 IP 地址
 //   - 在路由表中查找对应客户端
-//   - 帧封装后通过 HTTP/2 响应体发送给客户端
+//   - 通过客户端的 writePacket 发送（自动处理帧封装或直接发送）
 func (m *tunManager) readLoop() {
 	buf := make([]byte, m.dev.MTU+100)
-	frameBuf := make([]byte, 2+m.dev.MTU+100)
 	for {
 		n, err := m.dev.Read(buf)
 		if err != nil {
@@ -239,13 +248,9 @@ func (m *tunManager) readLoop() {
 			continue
 		}
 
-		// 帧封装：[2字节长度][IP包]
-		binary.BigEndian.PutUint16(frameBuf[:2], uint16(n))
-		copy(frameBuf[2:], buf[:n])
-
 		client.mu.Lock()
 		if !client.closed {
-			if _, err := client.writer.Write(frameBuf[:2+n]); err != nil {
+			if err := client.writePacket(buf[:n]); err != nil {
 				log.Printf("[TUN] 发送到客户端 %s 错误: %v", destIP, err)
 			}
 		}
@@ -253,7 +258,28 @@ func (m *tunManager) readLoop() {
 	}
 }
 
-// handleTUNTunnel 处理 TUN 隧道请求
+// makeFrameWriter 创建一个帧封装写入函数
+//
+// 将 IP 包封装为 [2字节大端序长度][IP包] 格式后写入 Writer。
+// 用于 HTTP/2 和 TCP 明文传输的 TUN 数据发送。
+// 注意：返回的函数通过 tunClient.mu 保护，非并发安全。
+func makeFrameWriter(w io.Writer) func([]byte) error {
+	frameBuf := make([]byte, 0, 2+1500)
+	return func(data []byte) error {
+		needed := 2 + len(data)
+		if cap(frameBuf) < needed {
+			frameBuf = make([]byte, needed)
+		} else {
+			frameBuf = frameBuf[:needed]
+		}
+		binary.BigEndian.PutUint16(frameBuf[:2], uint16(len(data)))
+		copy(frameBuf[2:], data)
+		_, err := w.Write(frameBuf[:needed])
+		return err
+	}
+}
+
+// handleTUNTunnel 处理 HTTP/2 传输方式的 TUN 隧道请求
 //
 // 协议：
 //   - 客户端通过 X-TUN-IP 头注册自己的 TUN IP
@@ -304,8 +330,9 @@ func handleTUNTunnel(w http.ResponseWriter, r *http.Request, token string, mgr *
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	fw := &flushWriter{w: w, f: flusher}
 	client := &tunClient{
-		writer: &flushWriter{w: w, f: flusher},
+		writePacket: makeFrameWriter(fw),
 	}
 
 	mgr.register(clientIP, client)
@@ -357,11 +384,19 @@ func handleTUNTunnel(w http.ResponseWriter, r *http.Request, token string, mgr *
 func main() {
 	// ========== 命令行参数 ==========
 	configFile := flag.String("config", "server_config.json", "配置文件路径")
-	flagAddr := flag.String("addr", "", "服务端监听地址")
+	flagAddr := flag.String("addr", "", "HTTP/2 监听地址")
 	flagCert := flag.String("cert", "", "TLS 证书文件路径")
 	flagKey := flag.String("key", "", "TLS 私钥文件路径")
 	flagToken := flag.String("token", "", "认证令牌（留空则不启用认证）")
 	flagDialTimeout := flag.String("dial-timeout", "", "连接目标服务器的超时时间（如 10s、30s）")
+
+	// TCP 明文传输参数
+	flagRawTCPEnabled := flag.Bool("raw-tcp", false, "启用 TCP 明文传输")
+	flagRawTCPAddr := flag.String("raw-tcp-addr", "", "TCP 明文监听地址（如 :9443）")
+
+	// UDP 明文传输参数
+	flagRawUDPEnabled := flag.Bool("raw-udp", false, "启用 UDP 明文传输")
+	flagRawUDPAddr := flag.String("raw-udp-addr", "", "UDP 明文监听地址（如 :9444）")
 
 	// TUN 隧道参数
 	flagTunEnabled := flag.Bool("tun", false, "启用 TUN 隧道功能")
@@ -388,6 +423,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("[致命] 解析连接超时时间失败 %q: %v", dialTimeoutStr, err)
 	}
+
+	// TCP 明文传输参数合并
+	rawTCPEnabled := *flagRawTCPEnabled || cfg.RawTCPEnabled
+	rawTCPAddr := mergeString(*flagRawTCPAddr, cfg.RawTCPAddr, ":9443")
+
+	// UDP 明文传输参数合并
+	rawUDPEnabled := *flagRawUDPEnabled || cfg.RawUDPEnabled
+	rawUDPAddr := mergeString(*flagRawUDPAddr, cfg.RawUDPAddr, ":9444")
 
 	// TUN 参数合并
 	tunEnabled := *flagTunEnabled || cfg.TunEnabled
@@ -425,11 +468,20 @@ func main() {
 		if tunEnabled {
 			tunStatus = "enabled"
 		}
-		fmt.Fprintf(w, `{"status":"ok","active_connections":%d,"protocol":"%s","tun":"%s"}`,
-			atomic.LoadInt64(&activeConns), r.Proto, tunStatus)
+		rawTCPStatus := "disabled"
+		if rawTCPEnabled {
+			rawTCPStatus = "enabled"
+		}
+		rawUDPStatus := "disabled"
+		if rawUDPEnabled {
+			rawUDPStatus = "enabled"
+		}
+		fmt.Fprintf(w, `{"status":"ok","active_connections":%d,"protocol":"%s","tun":"%s","raw_tcp":"%s","raw_udp":"%s"}`,
+			atomic.LoadInt64(&activeConns), r.Proto, tunStatus, rawTCPStatus, rawUDPStatus)
 	})
 
 	// ========== TUN 隧道设置 ==========
+	var tunMgr *tunManager
 	if tunEnabled {
 		tunDev, err := tun.CreateTUN(tunName, tunIP, tunMTU)
 		if err != nil {
@@ -437,15 +489,25 @@ func main() {
 		}
 		defer tunDev.Close()
 
-		mgr := newTUNManager(tunDev)
-		go mgr.readLoop()
+		tunMgr = newTUNManager(tunDev)
+		go tunMgr.readLoop()
 
-		// /tun - TUN IP 隧道端点
+		// /tun - TUN IP 隧道端点（HTTP/2 传输）
 		mux.HandleFunc("/tun", func(w http.ResponseWriter, r *http.Request) {
-			handleTUNTunnel(w, r, token, mgr)
+			handleTUNTunnel(w, r, token, tunMgr)
 		})
 
 		log.Printf("[TUN] 接口已创建: %s (IP: %s, MTU: %d)", tunDev.Name(), tunIP, tunMTU)
+	}
+
+	// ========== 启动 TCP 明文传输 ==========
+	if rawTCPEnabled {
+		go startRawTCPListener(rawTCPAddr, token, dialTimeout, tunMgr)
+	}
+
+	// ========== 启动 UDP 明文传输 ==========
+	if rawUDPEnabled {
+		go startRawUDPListener(rawUDPAddr, token, dialTimeout, tunMgr)
 	}
 
 	// ========== 配置 TLS ==========
@@ -486,9 +548,9 @@ func main() {
 		log.Fatalf("[致命] 配置 HTTP/2 失败: %v", err)
 	}
 
-	log.Printf("[启动] HTTP/2 隧道服务端（性能优化版）")
+	log.Printf("[启动] HTTP/2 隧道服务端（多传输方式版）")
 	log.Printf("[配置] 配置文件: %s", *configFile)
-	log.Printf("[配置] 监听地址: %s", addr)
+	log.Printf("[HTTP/2] 监听地址: %s (TLS)", addr)
 	log.Printf("[配置] 证书文件: %s", certFile)
 	log.Printf("[配置] 私钥文件: %s", keyFile)
 	log.Printf("[配置] 连接超时: %s", dialTimeout)
@@ -500,6 +562,16 @@ func main() {
 		log.Printf("[配置] 认证令牌: 已启用")
 	} else {
 		log.Printf("[配置] 认证令牌: 未启用")
+	}
+	if rawTCPEnabled {
+		log.Printf("[TCP传输] 明文传输: 已启用 (地址: %s)", rawTCPAddr)
+	} else {
+		log.Printf("[TCP传输] 明文传输: 未启用")
+	}
+	if rawUDPEnabled {
+		log.Printf("[UDP传输] 明文传输: 已启用 (地址: %s)", rawUDPAddr)
+	} else {
+		log.Printf("[UDP传输] 明文传输: 未启用")
 	}
 	if tunEnabled {
 		log.Printf("[TUN] 隧道功能: 已启用 (IP: %s, MTU: %d)", tunIP, tunMTU)
@@ -523,7 +595,7 @@ func mergeString(flagVal, cfgVal, defaultVal string) string {
 	return defaultVal
 }
 
-// handleTunnel 处理单个隧道请求，根据 X-Protocol 头分发到 TCP 或 UDP 处理逻辑
+// handleTunnel 处理单个 HTTP/2 隧道请求，根据 X-Protocol 头分发到 TCP 或 UDP 处理逻辑
 func handleTunnel(w http.ResponseWriter, r *http.Request, token string, dialTimeout time.Duration) {
 	// 仅允许 POST 方法（用于承载请求体数据流）
 	if r.Method != http.MethodPost {
