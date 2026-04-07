@@ -1,18 +1,22 @@
 // HTTP/2 隧道代理 - 服务端
 //
-// 功能：接收客户端的 HTTP/2 连接请求，根据协议类型将数据转发到目标 TCP 或 UDP 服务器。
+// 功能：接收客户端的 HTTP/2 连接请求，根据协议类型将数据转发到目标 TCP、UDP 服务器，
+// 或通过 TUN 虚拟网络接口实现 IP 层互联互通。
 //
 // 数据流向：
 //   TCP 模式: 客户端 HTTP/2 stream ↔ 服务端 ↔ 目标 TCP 连接
 //   UDP 模式: 客户端 HTTP/2 stream ↔ 服务端(帧封装/解封) ↔ 目标 UDP 端点
+//   TUN 模式: 客户端 TUN ↔ HTTP/2 stream ↔ 服务端 TUN（IP 层点对点隧道）
 //
 // 协议设计：
-//   - 客户端通过 POST /tunnel 发起隧道请求
+//   - 客户端通过 POST /tunnel 发起 TCP/UDP 隧道请求
+//   - 客户端通过 POST /tun 发起 TUN IP 隧道请求
 //   - X-Target 头指定目标地址 (host:port)
 //   - X-Protocol 头指定协议类型（"tcp" 或 "udp"，默认 "tcp"）
 //   - X-Token 头用于可选的认证令牌校验
+//   - X-TUN-IP 头指定客户端 TUN 接口 IP（仅 TUN 模式）
 //   - TCP 模式：请求体/响应体直接承载字节流
-//   - UDP 模式：请求体/响应体使用帧封装 [2字节长度][数据报]
+//   - UDP/TUN 模式：请求体/响应体使用帧封装 [2字节长度][数据报/IP包]
 //   - 利用 HTTP/2 多路复用，多条隧道共享单个 TLS 连接
 
 package main
@@ -31,6 +35,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"http2tunnel/tun"
 
 	"golang.org/x/net/http2"
 )
@@ -83,6 +89,12 @@ type ServerConfig struct {
 	Key         string `json:"key"`          // TLS 私钥文件路径
 	Token       string `json:"token"`        // 认证令牌
 	DialTimeout string `json:"dial_timeout"` // 连接超时时间，如 "10s"、"30s"
+
+	// TUN 隧道配置
+	TunEnabled bool   `json:"tun_enabled"` // 是否启用 TUN 隧道功能
+	TunIP      string `json:"tun_ip"`      // TUN 接口 IP 地址（CIDR 格式），如 "10.0.0.1/24"
+	TunName    string `json:"tun_name"`    // TUN 接口名称（留空自动分配）
+	TunMTU     int    `json:"tun_mtu"`     // TUN 接口 MTU，默认 1400
 }
 
 // loadConfig 从 JSON 配置文件加载配置，若文件不存在则返回空配置（使用默认值）
@@ -139,6 +151,209 @@ func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
 // activeConns 记录当前活跃的隧道连接数，用于状态监控
 var activeConns int64
 
+// ==================== TUN 隧道管理 ====================
+
+// tunClient 表示一个已连接的 TUN 客户端
+type tunClient struct {
+	writer *flushWriter
+	mu     sync.Mutex
+	closed bool
+}
+
+// tunManager 管理服务端 TUN 设备和客户端路由
+type tunManager struct {
+	dev     *tun.Device
+	mu      sync.RWMutex
+	clients map[string]*tunClient // 客户端 IP → 连接
+}
+
+func newTUNManager(dev *tun.Device) *tunManager {
+	return &tunManager{
+		dev:     dev,
+		clients: make(map[string]*tunClient),
+	}
+}
+
+// register 将客户端加入路由表
+func (m *tunManager) register(ip string, client *tunClient) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clients[ip] = client
+	log.Printf("[TUN] 注册客户端: %s (当前客户端数: %d)", ip, len(m.clients))
+}
+
+// unregister 从路由表移除客户端
+func (m *tunManager) unregister(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.clients[ip]; ok {
+		c.mu.Lock()
+		c.closed = true
+		c.mu.Unlock()
+		delete(m.clients, ip)
+	}
+	log.Printf("[TUN] 注销客户端: %s (当前客户端数: %d)", ip, len(m.clients))
+}
+
+// readLoop 持续从 TUN 设备读取 IP 包，根据目的 IP 路由到对应客户端
+//
+// IP 包路由逻辑：
+//   - 解析 IP 包头获取目的 IP 地址
+//   - 在路由表中查找对应客户端
+//   - 帧封装后通过 HTTP/2 响应体发送给客户端
+func (m *tunManager) readLoop() {
+	buf := make([]byte, m.dev.MTU+100)
+	frameBuf := make([]byte, 2+m.dev.MTU+100)
+	for {
+		n, err := m.dev.Read(buf)
+		if err != nil {
+			log.Printf("[TUN] 读取设备错误: %v", err)
+			return
+		}
+		if n < 1 {
+			continue
+		}
+
+		// 从 IP 包头解析目的地址
+		version := buf[0] >> 4
+		var destIP string
+		switch version {
+		case 4:
+			if n < 20 {
+				continue
+			}
+			destIP = net.IP(buf[16:20]).String()
+		case 6:
+			if n < 40 {
+				continue
+			}
+			destIP = net.IP(buf[24:40]).String()
+		default:
+			continue
+		}
+
+		m.mu.RLock()
+		client, ok := m.clients[destIP]
+		m.mu.RUnlock()
+		if !ok {
+			continue
+		}
+
+		// 帧封装：[2字节长度][IP包]
+		binary.BigEndian.PutUint16(frameBuf[:2], uint16(n))
+		copy(frameBuf[2:], buf[:n])
+
+		client.mu.Lock()
+		if !client.closed {
+			if _, err := client.writer.Write(frameBuf[:2+n]); err != nil {
+				log.Printf("[TUN] 发送到客户端 %s 错误: %v", destIP, err)
+			}
+		}
+		client.mu.Unlock()
+	}
+}
+
+// handleTUNTunnel 处理 TUN 隧道请求
+//
+// 协议：
+//   - 客户端通过 X-TUN-IP 头注册自己的 TUN IP
+//   - 请求体承载客户端→服务端的帧封装 IP 包
+//   - 响应体承载服务端→客户端的帧封装 IP 包
+//   - 帧格式与 UDP 模式相同：[2字节大端序长度][IP包]
+func handleTUNTunnel(w http.ResponseWriter, r *http.Request, token string, mgr *tunManager) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "仅支持 POST 方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 认证校验
+	if token != "" {
+		if r.Header.Get("X-Token") != token {
+			log.Printf("[TUN] 认证失败: %s", r.RemoteAddr)
+			http.Error(w, "认证失败", http.StatusForbidden)
+			return
+		}
+	}
+
+	// 获取客户端 TUN IP
+	clientIP := r.Header.Get("X-TUN-IP")
+	if clientIP == "" {
+		http.Error(w, "缺少 X-TUN-IP 头", http.StatusBadRequest)
+		return
+	}
+
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		http.Error(w, "X-TUN-IP 格式错误", http.StatusBadRequest)
+		return
+	}
+
+	// 验证客户端 IP 在服务端 TUN 子网范围内
+	if !mgr.dev.Net.Contains(ip) {
+		http.Error(w, fmt.Sprintf("客户端 IP %s 不在 TUN 子网 %s 内", clientIP, mgr.dev.Net.String()), http.StatusBadRequest)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Printf("[TUN] ResponseWriter 不支持 Flusher")
+		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	client := &tunClient{
+		writer: &flushWriter{w: w, f: flusher},
+	}
+
+	mgr.register(clientIP, client)
+	defer mgr.unregister(clientIP)
+
+	current := atomic.AddInt64(&activeConns, 1)
+	log.Printf("[TUN] 客户端已连接: %s (来源: %s, 活跃: %d)", clientIP, r.RemoteAddr, current)
+	defer func() {
+		cur := atomic.AddInt64(&activeConns, -1)
+		log.Printf("[TUN] 客户端已断开: %s (来源: %s, 活跃: %d)", clientIP, r.RemoteAddr, cur)
+	}()
+
+	// 读取客户端发来的帧封装 IP 包，写入本地 TUN 设备
+	lenBuf := make([]byte, 2)
+	pktBuf := make([]byte, mgr.dev.MTU+100)
+	var totalBytes int64
+	for {
+		if _, err := io.ReadFull(r.Body, lenBuf); err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				log.Printf("[TUN] 读客户端帧头错误 (%s): %v", clientIP, err)
+			}
+			break
+		}
+		pktLen := binary.BigEndian.Uint16(lenBuf)
+		if pktLen == 0 {
+			continue
+		}
+		if int(pktLen) > len(pktBuf) {
+			log.Printf("[TUN] IP 包过大: %d 字节 (客户端: %s, MTU: %d)", pktLen, clientIP, mgr.dev.MTU)
+			// 跳过超大包
+			if _, err := io.CopyN(io.Discard, r.Body, int64(pktLen)); err != nil {
+				break
+			}
+			continue
+		}
+		if _, err := io.ReadFull(r.Body, pktBuf[:pktLen]); err != nil {
+			log.Printf("[TUN] 读客户端数据错误 (%s): %v", clientIP, err)
+			break
+		}
+		if _, err := mgr.dev.Write(pktBuf[:pktLen]); err != nil {
+			log.Printf("[TUN] 写 TUN 设备错误: %v", err)
+			break
+		}
+		totalBytes += int64(pktLen)
+	}
+	log.Printf("[TUN] 客户端→TUN: %d 字节 (%s)", totalBytes, clientIP)
+}
+
 func main() {
 	// ========== 命令行参数 ==========
 	configFile := flag.String("config", "server_config.json", "配置文件路径")
@@ -147,6 +362,13 @@ func main() {
 	flagKey := flag.String("key", "", "TLS 私钥文件路径")
 	flagToken := flag.String("token", "", "认证令牌（留空则不启用认证）")
 	flagDialTimeout := flag.String("dial-timeout", "", "连接目标服务器的超时时间（如 10s、30s）")
+
+	// TUN 隧道参数
+	flagTunEnabled := flag.Bool("tun", false, "启用 TUN 隧道功能")
+	flagTunIP := flag.String("tun-ip", "", "TUN 接口 IP 地址（CIDR 格式，如 10.0.0.1/24）")
+	flagTunName := flag.String("tun-name", "", "TUN 接口名称（留空自动分配）")
+	flagTunMTU := flag.Int("tun-mtu", 0, "TUN 接口 MTU（默认 1400）")
+
 	flag.Parse()
 
 	// ========== 加载配置文件 ==========
@@ -167,6 +389,18 @@ func main() {
 		log.Fatalf("[致命] 解析连接超时时间失败 %q: %v", dialTimeoutStr, err)
 	}
 
+	// TUN 参数合并
+	tunEnabled := *flagTunEnabled || cfg.TunEnabled
+	tunIP := mergeString(*flagTunIP, cfg.TunIP, "10.0.0.1/24")
+	tunName := mergeString(*flagTunName, cfg.TunName, "")
+	tunMTU := cfg.TunMTU
+	if *flagTunMTU > 0 {
+		tunMTU = *flagTunMTU
+	}
+	if tunMTU <= 0 {
+		tunMTU = tun.DefaultMTU
+	}
+
 	// 检查证书文件是否存在
 	if _, err := os.Stat(certFile); os.IsNotExist(err) {
 		log.Fatalf("[致命] 证书文件不存在: %s\n请使用以下命令生成自签名证书:\n"+
@@ -179,7 +413,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// /tunnel - 隧道请求处理端点
+	// /tunnel - TCP/UDP 隧道请求处理端点
 	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
 		handleTunnel(w, r, token, dialTimeout)
 	})
@@ -187,9 +421,32 @@ func main() {
 	// /status - 健康检查和状态监控端点
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","active_connections":%d,"protocol":"%s"}`,
-			atomic.LoadInt64(&activeConns), r.Proto)
+		tunStatus := "disabled"
+		if tunEnabled {
+			tunStatus = "enabled"
+		}
+		fmt.Fprintf(w, `{"status":"ok","active_connections":%d,"protocol":"%s","tun":"%s"}`,
+			atomic.LoadInt64(&activeConns), r.Proto, tunStatus)
 	})
+
+	// ========== TUN 隧道设置 ==========
+	if tunEnabled {
+		tunDev, err := tun.CreateTUN(tunName, tunIP, tunMTU)
+		if err != nil {
+			log.Fatalf("[致命] 创建 TUN 接口失败: %v", err)
+		}
+		defer tunDev.Close()
+
+		mgr := newTUNManager(tunDev)
+		go mgr.readLoop()
+
+		// /tun - TUN IP 隧道端点
+		mux.HandleFunc("/tun", func(w http.ResponseWriter, r *http.Request) {
+			handleTUNTunnel(w, r, token, mgr)
+		})
+
+		log.Printf("[TUN] 接口已创建: %s (IP: %s, MTU: %d)", tunDev.Name(), tunIP, tunMTU)
+	}
 
 	// ========== 配置 TLS ==========
 	tlsConfig := &tls.Config{
@@ -243,6 +500,11 @@ func main() {
 		log.Printf("[配置] 认证令牌: 已启用")
 	} else {
 		log.Printf("[配置] 认证令牌: 未启用")
+	}
+	if tunEnabled {
+		log.Printf("[TUN] 隧道功能: 已启用 (IP: %s, MTU: %d)", tunIP, tunMTU)
+	} else {
+		log.Printf("[TUN] 隧道功能: 未启用")
 	}
 
 	if err := server.ListenAndServeTLS(certFile, keyFile); err != nil {
@@ -309,16 +571,6 @@ func handleTunnel(w http.ResponseWriter, r *http.Request, token string, dialTime
 }
 
 // handleTCPTunnel 处理 TCP 隧道请求
-//
-// 性能优化点：
-//   - 使用 256KB 缓冲区代替默认 32KB，减少系统调用
-//   - 使用 sync.Pool 复用缓冲区，减少 GC 压力
-//   - 设置目标连接 TCP NoDelay + 大缓冲区
-//
-// 流程：
-//  1. 建立到目标的 TCP 连接（设置 socket 优化参数）
-//  2. 发送 200 响应，开始双向字节流转发
-//  3. 等待任一方向的数据传输完成后关闭隧道
 func handleTCPTunnel(w http.ResponseWriter, r *http.Request, flusher http.Flusher, target string, dialTimeout time.Duration) {
 	log.Printf("[连接] TCP 隧道请求: %s → %s (协议: %s)", r.RemoteAddr, target, r.Proto)
 
@@ -374,22 +626,6 @@ func handleTCPTunnel(w http.ResponseWriter, r *http.Request, flusher http.Flushe
 }
 
 // handleUDPTunnel 处理 UDP 隧道请求
-//
-// 性能优化点：
-//   - 使用 sync.Pool 复用 UDP 缓冲区，减少 GC 压力
-//   - 帧头和数据合并为单次写入，减少系统调用和 HTTP/2 帧开销
-//
-// UDP 数据报通过 HTTP/2 字节流传输时，使用长度前缀帧封装以保留包边界：
-//
-//	+----------+-------------------+
-//	| LEN (2B) | UDP 数据报 (LEN B) |
-//	+----------+-------------------+
-//	  大端序      最大 65535 字节
-//
-// 流程：
-//  1. 建立到目标的 UDP 连接
-//  2. 发送 200 响应，开始双向帧封装/解封转发
-//  3. 任一方向结束后清理资源
 func handleUDPTunnel(w http.ResponseWriter, r *http.Request, flusher http.Flusher, target string, dialTimeout time.Duration) {
 	log.Printf("[连接] UDP 隧道请求: %s → %s (协议: %s)", r.RemoteAddr, target, r.Proto)
 
@@ -428,17 +664,14 @@ func handleUDPTunnel(w http.ResponseWriter, r *http.Request, flusher http.Flushe
 	wg.Add(2)
 
 	// 方向1: 客户端 → 目标 UDP
-	// 从 HTTP/2 请求体读取帧封装的 UDP 数据报，解封后发送到目标
 	go func() {
 		defer wg.Done()
 		var totalBytes int64
 		lenBuf := make([]byte, 2)
-		// 使用池化缓冲区读取 UDP 数据报
 		bufp := udpBufPool.Get().(*[]byte)
 		defer udpBufPool.Put(bufp)
 		pktBuf := *bufp
 		for {
-			// 读取 2 字节长度前缀
 			if _, err := io.ReadFull(r.Body, lenBuf); err != nil {
 				if err != io.EOF && err != io.ErrUnexpectedEOF {
 					log.Printf("[数据] 客户端→目标 UDP 读帧头错误 (%s → %s): %v", r.RemoteAddr, target, err)
@@ -450,13 +683,11 @@ func handleUDPTunnel(w http.ResponseWriter, r *http.Request, flusher http.Flushe
 				continue
 			}
 
-			// 读取数据报内容到池化缓冲区（避免每次 make）
 			if _, err := io.ReadFull(r.Body, pktBuf[:pktLen]); err != nil {
 				log.Printf("[数据] 客户端→目标 UDP 读数据报错误 (%s → %s): %v", r.RemoteAddr, target, err)
 				break
 			}
 
-			// 发送到目标 UDP 端点
 			if _, err := udpConn.Write(pktBuf[:pktLen]); err != nil {
 				log.Printf("[数据] 客户端→目标 UDP 发送错误 (%s → %s): %v", r.RemoteAddr, target, err)
 				break
@@ -467,25 +698,20 @@ func handleUDPTunnel(w http.ResponseWriter, r *http.Request, flusher http.Flushe
 	}()
 
 	// 方向2: 目标 UDP → 客户端
-	// 从目标读取 UDP 数据报，帧封装后通过 HTTP/2 响应体发送给客户端
 	go func() {
 		defer wg.Done()
 		fw := &flushWriter{w: w, f: flusher}
 		var totalBytes int64
-		// 使用池化缓冲区，前 2 字节预留给长度前缀
 		bufp := udpBufPool.Get().(*[]byte)
 		defer udpBufPool.Put(bufp)
 		buf := *bufp
 		for {
-			// 从目标 UDP 端点读取数据报（偏移 2 字节给帧头）
 			n, err := udpConn.Read(buf[2:])
 			if err != nil {
 				log.Printf("[数据] 目标→客户端 UDP 接收错误 (%s ← %s): %v", r.RemoteAddr, target, err)
 				break
 			}
 
-			// 在数据前面填入 2 字节长度前缀，然后一次性写入
-			// 减少了两次 Write/Flush 的开销
 			binary.BigEndian.PutUint16(buf[:2], uint16(n))
 			if _, err := fw.Write(buf[:2+n]); err != nil {
 				log.Printf("[数据] 目标→客户端 UDP 写帧错误 (%s ← %s): %v", r.RemoteAddr, target, err)

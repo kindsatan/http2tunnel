@@ -3,5 +3,9 @@
     "cert": "cert.pem",
     "key": "key.pem",
     "token": "zhc",
-    "dial_timeout": "10s"
+    "dial_timeout": "10s",
+    "tun_enabled": false,
+    "tun_ip": "10.0.0.1/24",
+    "tun_name": "",
+    "tun_mtu": 1400
 }
