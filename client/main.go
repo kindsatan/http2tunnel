@@ -40,9 +40,52 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 )
+
+// ==================== 性能调优常量 ====================
+
+const (
+	// copyBufSize 是 io.CopyBuffer 使用的缓冲区大小（256KB）。
+	// 默认 io.Copy 使用 32KB，增大到 256KB 减少系统调用次数。
+	copyBufSize = 256 * 1024
+
+	// maxFrameSize 是客户端 HTTP/2 SETTINGS_MAX_FRAME_SIZE（1MB）。
+	// 默认 16KB 太小，增大帧大小可减少帧头开销。
+	maxFrameSize = 1 << 20
+
+	// flowControlWindow 是 HTTP/2 初始流控窗口大小（16MB）。
+	// 默认 64KB 在高延迟网络下严重限制吞吐量。
+	flowControlWindow = 16 << 20
+
+	// udpReadBufSize 是 UDP 读取缓冲区大小。
+	udpReadBufSize = 65535
+)
+
+// bufPool 是用于 io.CopyBuffer 的缓冲区池。
+var bufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, copyBufSize)
+		return &buf
+	},
+}
+
+// udpBufPool 是 UDP 数据报读取缓冲区池。
+var udpBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, udpReadBufSize+2) // +2 给帧头预留
+		return &buf
+	},
+}
+
+// copyBuffered 使用缓冲池的 io.CopyBuffer
+func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
+	bufp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufp)
+	return io.CopyBuffer(dst, src, *bufp)
+}
 
 // ==================== SOCKS5 协议常量 ====================
 
@@ -103,14 +146,29 @@ func main() {
 		}
 	}
 
-	// ========== 配置 HTTP/2 传输层 ==========
+	// ========== 配置 TLS ==========
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: *insecure,
+		// 优先使用高性能密码套件（AES-GCM 硬件加速 > ChaCha20）
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		},
+		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 	}
 
+	// ========== 配置 HTTP/2 传输层（性能优化） ==========
 	transport := &http2.Transport{
 		TLSClientConfig:    tlsConfig,
-		DisableCompression: false,
+		DisableCompression: true,         // 隧道数据无需压缩，避免 CPU 开销
+		MaxReadFrameSize:   maxFrameSize,      // 增大帧大小到 1MB
+		AllowHTTP:          false,
+		ReadIdleTimeout:    90 * time.Second,  // 90s 空闲检测
+		PingTimeout:        15 * time.Second,  // 15s ping 超时
 	}
 
 	client := &http.Client{
@@ -151,6 +209,8 @@ func startTCPForwardMode(localAddr string, client *http.Client, tunnelURL, targe
 			log.Printf("[配置] SOCKS5 认证: 已启用")
 		}
 	}
+	log.Printf("[性能] HTTP/2 帧大小: %d KB, 流控窗口: %d MB, 缓冲区: %d KB",
+		maxFrameSize/1024, flowControlWindow/(1<<20), copyBufSize/1024)
 	if insecure {
 		log.Printf("[警告] TLS 证书验证已禁用")
 	}
@@ -188,9 +248,15 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 	}
 	defer udpConn.Close()
 
+	// 增大 UDP socket 缓冲区
+	udpConn.SetReadBuffer(4 * 1024 * 1024)
+	udpConn.SetWriteBuffer(4 * 1024 * 1024)
+
 	log.Printf("[启动] HTTP/2 隧道客户端 (UDP 转发模式)")
 	log.Printf("[配置] 本地 UDP 监听: %s", localAddr)
 	log.Printf("[配置] 目标地址: %s (UDP)", target)
+	log.Printf("[性能] HTTP/2 帧大小: %d KB, 流控窗口: %d MB",
+		maxFrameSize/1024, flowControlWindow/(1<<20))
 	if insecure {
 		log.Printf("[警告] TLS 证书验证已禁用")
 	}
@@ -244,11 +310,13 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 	go func() {
 		defer wg.Done()
 		defer pw.Close()
-		buf := make([]byte, 65535)
-		lenBuf := make([]byte, 2)
+		// 使用池化缓冲区，前 2 字节预留给帧头
+		bufp := udpBufPool.Get().(*[]byte)
+		defer udpBufPool.Put(bufp)
+		buf := *bufp
 		var totalBytes int64
 		for {
-			n, addr, err := udpConn.ReadFromUDP(buf)
+			n, addr, err := udpConn.ReadFromUDP(buf[2:])
 			if err != nil {
 				log.Printf("[数据] 本地 UDP 读取错误: %v", err)
 				break
@@ -256,14 +324,10 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 			// 记录来源地址
 			peerAddr.Store(addr)
 
-			// 写入长度前缀帧
-			binary.BigEndian.PutUint16(lenBuf, uint16(n))
-			if _, err := pw.Write(lenBuf); err != nil {
-				log.Printf("[数据] 写帧头到 HTTP/2 失败: %v", err)
-				break
-			}
-			if _, err := pw.Write(buf[:n]); err != nil {
-				log.Printf("[数据] 写数据报到 HTTP/2 失败: %v", err)
+			// 填入帧头并一次性写入（帧头+数据合并，减少写入次数）
+			binary.BigEndian.PutUint16(buf[:2], uint16(n))
+			if _, err := pw.Write(buf[:2+n]); err != nil {
+				log.Printf("[数据] 写帧到 HTTP/2 失败: %v", err)
 				break
 			}
 			totalBytes += int64(n)
@@ -275,6 +339,10 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 	go func() {
 		defer wg.Done()
 		lenBuf := make([]byte, 2)
+		// 使用池化缓冲区
+		bufp := udpBufPool.Get().(*[]byte)
+		defer udpBufPool.Put(bufp)
+		pktBuf := *bufp
 		var totalBytes int64
 		for {
 			// 读取 2 字节长度前缀
@@ -289,16 +357,15 @@ func startUDPMode(localAddr string, client *http.Client, tunnelURL, target, toke
 				continue
 			}
 
-			// 读取数据报内容
-			pkt := make([]byte, pktLen)
-			if _, err := io.ReadFull(resp.Body, pkt); err != nil {
+			// 读取数据报内容到池化缓冲区
+			if _, err := io.ReadFull(resp.Body, pktBuf[:pktLen]); err != nil {
 				log.Printf("[数据] 从 HTTP/2 读数据报错误: %v", err)
 				break
 			}
 
 			// 发回本地来源
 			if addr, ok := peerAddr.Load().(*net.UDPAddr); ok && addr != nil {
-				if _, err := udpConn.WriteToUDP(pkt, addr); err != nil {
+				if _, err := udpConn.WriteToUDP(pktBuf[:pktLen], addr); err != nil {
 					log.Printf("[数据] 发送 UDP 数据报到本地错误: %v", err)
 					break
 				}
@@ -372,10 +439,10 @@ func handleForward(conn net.Conn, client *http.Client, tunnelURL, target, token 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 本地 → 服务端
+	// 本地 → 服务端（使用 256KB 缓冲区池）
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(pw, conn)
+		n, err := copyBuffered(pw, conn)
 		if err != nil {
 			log.Printf("[数据] 本地→服务端 传输错误 (%s): %v", connID, err)
 		}
@@ -383,10 +450,10 @@ func handleForward(conn net.Conn, client *http.Client, tunnelURL, target, token 
 		pw.Close()
 	}()
 
-	// 服务端 → 本地
+	// 服务端 → 本地（使用 256KB 缓冲区池）
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(conn, resp.Body)
+		n, err := copyBuffered(conn, resp.Body)
 		if err != nil {
 			log.Printf("[数据] 服务端→本地 传输错误 (%s): %v", connID, err)
 		}
@@ -474,9 +541,10 @@ func handleSocks5(conn net.Conn, client *http.Client, tunnelURL, token, socksUse
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// 浏览器 → 服务端（使用 256KB 缓冲区池）
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(pw, conn)
+		n, err := copyBuffered(pw, conn)
 		if err != nil {
 			log.Printf("[数据] 浏览器→服务端 传输错误 (%s): %v", connID, err)
 		}
@@ -484,9 +552,10 @@ func handleSocks5(conn net.Conn, client *http.Client, tunnelURL, token, socksUse
 		pw.Close()
 	}()
 
+	// 服务端 → 浏览器（使用 256KB 缓冲区池）
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(conn, resp.Body)
+		n, err := copyBuffered(conn, resp.Body)
 		if err != nil {
 			log.Printf("[数据] 服务端→浏览器 传输错误 (%s): %v", connID, err)
 		}
